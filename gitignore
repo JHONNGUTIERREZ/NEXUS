@@ -1,1 +1,1922 @@
 
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace NexusTrainingSystem
+{
+    // ##########################################################
+    //  UTILIDADES Y EXCEPCIONES
+    // ##########################################################
+
+    static class Azar
+    {
+        public static readonly Random Rng = new Random();
+    }
+
+    // Excepción para operaciones inválidas (menú, inventario, combate...).
+    class OperacionInvalidaException : Exception
+    {
+        public OperacionInvalidaException(string mensaje) : base(mensaje) { }
+    }
+
+    // ##########################################################
+    //  REALIDADES DIMENSIONALES
+    // ##########################################################
+
+    enum EstadoRealidad
+    {
+        Estable,
+        Inestable,
+        Critica
+    }
+
+    class RealidadDimensional
+    {
+        public const int INESTABILIDAD_MAX = 100;
+        public const int INESTABILIDAD_MIN = 0;
+        public const int UMBRAL_INESTABLE = 40;
+        public const int UMBRAL_CRITICA = 75;
+
+        private readonly string nombre;
+        private readonly int factorRiesgo;
+        private int nivelInestabilidad;
+        private int vecesExploradas;
+        private EstadoRealidad estado;
+
+        public string Nombre { get { return nombre; } }
+        public int FactorRiesgo { get { return factorRiesgo; } }
+        public int NivelInestabilidad { get { return nivelInestabilidad; } }
+        public int VecesExploradas { get { return vecesExploradas; } }
+        public EstadoRealidad Estado { get { return estado; } }
+
+        public event Action<RealidadDimensional, EstadoRealidad, EstadoRealidad> EstadoCambiado;
+
+        public RealidadDimensional(string nombre, int inestabilidadInicial, int factorRiesgo)
+        {
+            if (string.IsNullOrWhiteSpace(nombre))
+                throw new ArgumentException("Una realidad debe tener nombre.", nameof(nombre));
+            if (factorRiesgo < 1 || factorRiesgo > 30)
+                throw new ArgumentOutOfRangeException(nameof(factorRiesgo), "El factor de riesgo debe estar entre 1 y 30.");
+
+            this.nombre = nombre.Trim();
+            this.factorRiesgo = factorRiesgo;
+            this.nivelInestabilidad = Limitar(inestabilidadInicial);
+            this.vecesExploradas = 0;
+            this.estado = CalcularEstado();
+        }
+
+        public void RegistrarExploracion()
+        {
+            vecesExploradas++;
+            AjustarInestabilidad(factorRiesgo);
+        }
+
+        public void Estabilizar(int cantidad)
+        {
+            if (cantidad <= 0) return;
+            AjustarInestabilidad(-cantidad);
+        }
+
+        public int ObtenerCostoExtraEnergia()
+        {
+            switch (estado)
+            {
+                case EstadoRealidad.Inestable: return 5;
+                case EstadoRealidad.Critica: return 10;
+                default: return 0;
+            }
+        }
+
+        public int ObtenerPerdidaEstabilidad()
+        {
+            switch (estado)
+            {
+                case EstadoRealidad.Inestable: return 5;
+                case EstadoRealidad.Critica: return 12;
+                default: return 0;
+            }
+        }
+
+        public int ObtenerCostoViaje()
+        {
+            return 10 + nivelInestabilidad / 10;
+        }
+
+        public string Describir()
+        {
+            return $"{nombre} | Estado: {estado} | Inestabilidad: {nivelInestabilidad}/{INESTABILIDAD_MAX} | " +
+                   $"Riesgo: x{factorRiesgo} | Exploraciones: {vecesExploradas}";
+        }
+
+        private void AjustarInestabilidad(int delta)
+        {
+            nivelInestabilidad = Limitar(nivelInestabilidad + delta);
+            EstadoRealidad anterior = estado;
+            estado = CalcularEstado();
+
+            if (estado != anterior && EstadoCambiado != null)
+                EstadoCambiado(this, anterior, estado);
+        }
+
+        private EstadoRealidad CalcularEstado()
+        {
+            if (nivelInestabilidad >= UMBRAL_CRITICA) return EstadoRealidad.Critica;
+            if (nivelInestabilidad >= UMBRAL_INESTABLE) return EstadoRealidad.Inestable;
+            return EstadoRealidad.Estable;
+        }
+
+        private static int Limitar(int valor)
+        {
+            if (valor > INESTABILIDAD_MAX) return INESTABILIDAD_MAX;
+            if (valor < INESTABILIDAD_MIN) return INESTABILIDAD_MIN;
+            return valor;
+        }
+    }
+
+    // ##########################################################
+    //  CONSOLA IRIS (sockets TCP sobre localhost)
+    // ##########################################################
+
+    class IrisConsola
+    {
+        private const int PUERTO = 5050;
+
+        private TcpListener listener;
+        private TcpClient clienteEscucha;
+        private TcpClient clienteEnvio;
+        private StreamWriter escritor;
+        private Thread hiloEscucha;
+
+        public bool Activo { get; private set; }
+
+        public void Iniciar()
+        {
+            try
+            {
+                listener = new TcpListener(IPAddress.Loopback, PUERTO);
+                listener.Start();
+
+                hiloEscucha = new Thread(EscucharMensajes);
+                hiloEscucha.IsBackground = true;
+                hiloEscucha.Start();
+
+                clienteEnvio = new TcpClient();
+                clienteEnvio.Connect(IPAddress.Loopback, PUERTO);
+                escritor = new StreamWriter(clienteEnvio.GetStream());
+                escritor.AutoFlush = true;
+
+                Activo = true;
+            }
+            catch (Exception)
+            {
+                Activo = false;
+            }
+        }
+
+        private void EscucharMensajes()
+        {
+            try
+            {
+                clienteEscucha = listener.AcceptTcpClient();
+                using (StreamReader lector = new StreamReader(clienteEscucha.GetStream()))
+                {
+                    string linea;
+                    while ((linea = lector.ReadLine()) != null)
+                    {
+                        if (linea == "__CERRAR__") break;
+
+                        lock (Program.ConsoleLock)
+                        {
+                            ConsoleColor original = Console.ForegroundColor;
+                            Console.ForegroundColor = ConsoleColor.DarkMagenta;
+                            Console.WriteLine($"\n[CONSOLA IRIS] {linea}");
+                            Console.ForegroundColor = original;
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        public void Enviar(string mensaje)
+        {
+            if (!Activo) return;
+            try
+            {
+                escritor.WriteLine(mensaje);
+            }
+            catch (Exception)
+            {
+                Activo = false;
+            }
+        }
+
+        public void Cerrar()
+        {
+            try { Enviar("__CERRAR__"); } catch { }
+            Thread.Sleep(100); // deja que el hilo escuche termine de imprimir
+            try { escritor?.Close(); } catch { }
+            try { clienteEnvio?.Close(); } catch { }
+            try { clienteEscucha?.Close(); } catch { }
+            try { listener?.Stop(); } catch { }
+            Activo = false;
+        }
+    }
+
+    // ##########################################################
+    //  SISTEMA DE PERSONAJES
+    //
+    //            Personaje (abstracta)
+    //        ┌───────────┼───────────┐
+    //     Cadete       Robot      Enemigo
+    //   (Explorador)
+    // ##########################################################
+
+    abstract class Personaje
+    {
+        public string Nombre { get; }
+        public int VidaMax { get; }
+        public int Vida { get; protected set; }
+        public int Ataque { get; protected set; }
+        public bool Analizado { get; set; }
+        public bool EstaVivo { get { return Vida > 0; } }
+
+        protected Personaje(string nombre, int vida, int ataque)
+        {
+            Nombre = nombre;
+            VidaMax = vida;
+            Vida = vida;
+            Ataque = ataque;
+        }
+
+        public virtual int RecibirDano(int dano)
+        {
+            if (dano < 0) dano = 0;
+            int real = Math.Min(dano, Vida);
+            Vida -= real;
+            return real;
+        }
+
+        public void Curar(int cantidad)
+        {
+            Vida = Math.Min(VidaMax, Vida + Math.Max(0, cantidad));
+        }
+
+        public abstract string Describir();
+
+        // Cómo responde el personaje cuando le toca actuar contra el Cadete.
+        public abstract string Reaccionar(Explorador cadete);
+    }
+
+    class Cadete : Personaje
+    {
+        public int XP { get; private set; }
+        public int Nivel { get { return XP / 100 + 1; } }
+        public int Escudo { get; private set; }
+        public int BonoAtaque { get; private set; }
+        public Inventario Inventario { get; } = new Inventario();
+
+        public Cadete(string nombre, int vida, int ataque) : base(nombre, vida, ataque) { }
+
+        // El escudo absorbe daño antes que la vida.
+        public override int RecibirDano(int dano)
+        {
+            if (dano < 0) dano = 0;
+            if (Escudo > 0)
+            {
+                int absorbido = Math.Min(Escudo, dano);
+                Escudo -= absorbido;
+                dano -= absorbido;
+            }
+            return base.RecibirDano(dano);
+        }
+
+        public void ActivarEscudo(int puntos) { Escudo += puntos; }
+        public void DesactivarEscudo() { Escudo = 0; }
+        public void ActivarBono(int bono) { BonoAtaque = bono; }
+
+        // El módulo de ataque se consume en el siguiente golpe.
+        public int CalcularAtaque()
+        {
+            int dano = Ataque + BonoAtaque + Azar.Rng.Next(-2, 4);
+            BonoAtaque = 0;
+            return Math.Max(1, dano);
+        }
+
+        public bool GanarXP(int cantidad)
+        {
+            int antes = Nivel;
+            XP += cantidad;
+            if (Nivel > antes)
+            {
+                Ataque += 2;
+                Curar(15);
+                return true;
+            }
+            return false;
+        }
+
+        public override string Describir()
+        {
+            return $"Cadete {Nombre} | Nivel {Nivel} | Vida {Vida}/{VidaMax} | Ataque {Ataque}";
+        }
+
+        public override string Reaccionar(Explorador cadete) { return ""; }
+    }
+
+    class Robot : Personaje
+    {
+        public Robot(string nombre) : base(nombre, 40, 6) { }
+
+        // Blindaje: reduce 40% del daño, salvo que su punto débil esté expuesto.
+        public override int RecibirDano(int dano)
+        {
+            if (!Analizado) dano = dano * 6 / 10;
+            return base.RecibirDano(dano);
+        }
+
+        // Sistema defensivo: pulso EMP que drena energía y daña.
+        public override string Reaccionar(Explorador cadete)
+        {
+            cadete.AjustarEnergia(-8);
+            int dano = cadete.RecibirDano(Ataque + 2);
+            return $"🤖 {Nombre} activa su SISTEMA DEFENSIVO: pulso EMP. -8 energía, -{dano} vida.";
+        }
+
+        public override string Describir()
+        {
+            if (!Analizado) return $"Robot {Nombre} | Datos incompletos (analiza para ver su punto débil)";
+            return $"Robot {Nombre} | Vida {Vida}/{VidaMax} | Ataque {Ataque} | Blindaje desactivado: punto débil expuesto";
+        }
+    }
+
+    class Enemigo : Personaje
+    {
+        public Enemigo(string nombre, int vida, int ataque) : base(nombre, vida, ataque) { }
+
+        // Si se analiza se descubre su debilidad (+50% de daño recibido).
+        public override int RecibirDano(int dano)
+        {
+            if (Analizado) dano = dano * 3 / 2;
+            return base.RecibirDano(dano);
+        }
+
+        public override string Reaccionar(Explorador cadete)
+        {
+            int dano = cadete.RecibirDano(Ataque + Azar.Rng.Next(-3, 4));
+            return $"👾 {Nombre} contraataca: -{dano} vida.";
+        }
+
+        public override string Describir()
+        {
+            if (!Analizado) return $"Enemigo {Nombre} | Datos incompletos (analiza para ver su debilidad)";
+            return $"Enemigo {Nombre} | Vida {Vida}/{VidaMax} | Ataque {Ataque} | Debilidad detectada: +50% de daño";
+        }
+    }
+
+    // ##########################################################
+    //  SISTEMA DE INVENTARIO
+    // ##########################################################
+
+    enum TipoObjeto { Celula, Escudo, Modulo, Analizador }
+
+    class Objeto
+    {
+        public string Nombre { get; }
+        public TipoObjeto Tipo { get; }
+        public string Icono { get; }
+        public int Cantidad { get; set; }
+
+        public Objeto(string nombre, TipoObjeto tipo, string icono, int cantidad = 1)
+        {
+            Nombre = nombre;
+            Tipo = tipo;
+            Icono = icono;
+            Cantidad = cantidad;
+        }
+
+        public static Objeto Crear(TipoObjeto tipo)
+        {
+            switch (tipo)
+            {
+                case TipoObjeto.Celula: return new Objeto("Célula de energía", tipo, "🔋");
+                case TipoObjeto.Escudo: return new Objeto("Escudo", tipo, "🛡️");
+                case TipoObjeto.Modulo: return new Objeto("Módulo de ataque", tipo, "🔫");
+                default: return new Objeto("Analizador", TipoObjeto.Analizador, "🔬");
+            }
+        }
+
+        public static Objeto ModuloDesconocido()
+        {
+            return new Objeto("Módulo desconocido", TipoObjeto.Modulo, "❓");
+        }
+
+        public static Objeto Aleatorio()
+        {
+            int t = Azar.Rng.Next(1, 101);
+            if (t <= 40) return Crear(TipoObjeto.Celula);
+            if (t <= 65) return Crear(TipoObjeto.Escudo);
+            if (t <= 85) return Crear(TipoObjeto.Modulo);
+            return Crear(TipoObjeto.Analizador);
+        }
+    }
+
+    class Inventario
+    {
+        public const int CAPACIDAD = 10;
+        private readonly List<Objeto> objetos = new List<Objeto>();
+
+        public int Total { get { return objetos.Sum(o => o.Cantidad); } }
+
+        // AGREGAR
+        public bool Agregar(Objeto nuevo, bool ignorarLimite = false)
+        {
+            if (nuevo == null) throw new ArgumentNullException(nameof(nuevo));
+            if (!ignorarLimite && Total + nuevo.Cantidad > CAPACIDAD) return false;
+
+            Objeto existente = objetos.FirstOrDefault(o => o.Nombre == nuevo.Nombre);
+            if (existente != null) existente.Cantidad += nuevo.Cantidad;
+            else objetos.Add(nuevo);
+            return true;
+        }
+
+        // CONSULTAR
+        public void Consultar()
+        {
+            if (objetos.Count == 0)
+            {
+                Console.WriteLine("Inventario vacío.");
+                return;
+            }
+            Console.WriteLine($"Inventario ({Total}/{CAPACIDAD}):");
+            for (int i = 0; i < objetos.Count; i++)
+                Console.WriteLine($"  {i + 1}. {objetos[i].Icono} {objetos[i].Nombre} x{objetos[i].Cantidad}");
+        }
+
+        private static string Sin(string s)
+        {
+            return s.ToLower().Replace('á', 'a').Replace('é', 'e').Replace('í', 'i').Replace('ó', 'o').Replace('ú', 'u');
+        }
+
+        // Busca por número o por nombre. Distingue entre "no existe" y "no lo posee".
+        public Objeto Buscar(string entrada)
+        {
+            if (string.IsNullOrWhiteSpace(entrada))
+                throw new OperacionInvalidaException("No indicaste ningún objeto.");
+
+            entrada = Sin(entrada.Trim());
+
+            int indice;
+            if (int.TryParse(entrada, out indice))
+            {
+                if (indice < 1 || indice > objetos.Count)
+                    throw new OperacionInvalidaException($"No existe el objeto número {indice} en tu inventario.");
+                return objetos[indice - 1];
+            }
+
+            Objeto encontrado = objetos.FirstOrDefault(o => Sin(o.Nombre).Contains(entrada));
+            if (encontrado != null) return encontrado;
+
+            string[] conocidos = { "celula", "energia", "escudo", "modulo", "ataque", "analizador" };
+            if (conocidos.Any(k => k.Contains(entrada) || entrada.Contains(k)))
+                throw new OperacionInvalidaException($"No posees ningún objeto llamado '{entrada}'.");
+
+            throw new OperacionInvalidaException($"El objeto '{entrada}' no existe en NEXUS.");
+        }
+
+        // UTILIZAR (consume una unidad). Si hay objetivo, el Analizador lo analiza.
+        public string Utilizar(Objeto objeto, Explorador e, Personaje objetivo)
+        {
+            if (objeto == null || !objetos.Contains(objeto))
+                throw new OperacionInvalidaException("Ese objeto no está en tu inventario.");
+
+            string resultado;
+            switch (objeto.Tipo)
+            {
+                case TipoObjeto.Celula:
+                    {
+                        int antes = e.Energia;
+                        e.AjustarEnergia(25);
+                        resultado = $"{objeto.Icono} {objeto.Nombre} utilizada. Energía: {antes} → {e.Energia}";
+                        break;
+                    }
+                case TipoObjeto.Escudo:
+                    {
+                        e.ActivarEscudo(30);
+                        resultado = $"{objeto.Icono} Escudo activado: absorberá 30 de daño. (Escudo total: {e.Escudo})";
+                        break;
+                    }
+                case TipoObjeto.Modulo:
+                    {
+                        int bono = objeto.Nombre.Contains("desconocido") ? 25 : 15;
+                        e.ActivarBono(bono);
+                        resultado = $"{objeto.Icono} {objeto.Nombre} acoplado: tu próximo ataque hace +{bono} de daño.";
+                        break;
+                    }
+                default:
+                    {
+                        if (objetivo != null)
+                        {
+                            objetivo.Analizado = true;
+                            resultado = $"{objeto.Icono} Análisis completo: {objetivo.Describir()}";
+                        }
+                        else if (Azar.Rng.Next(1, 101) <= 50)
+                        {
+                            e.RegistrarFragmento();
+                            resultado = $"{objeto.Icono} El analizador recupera un fragmento de información sobre IRIS.";
+                        }
+                        else
+                        {
+                            resultado = $"{objeto.Icono} El analizador escanea la zona y no encuentra nada relevante.";
+                        }
+                        break;
+                    }
+            }
+
+            Eliminar(objeto, 1);
+            return resultado;
+        }
+
+        // ELIMINAR (quita unidades; si llega a 0 desaparece del inventario)
+        public void Eliminar(Objeto objeto, int cantidad)
+        {
+            if (objeto == null || !objetos.Contains(objeto))
+                throw new OperacionInvalidaException("Ese objeto no está en tu inventario.");
+            objeto.Cantidad -= Math.Max(1, cantidad);
+            if (objeto.Cantidad <= 0) objetos.Remove(objeto);
+        }
+    }
+
+    // ##########################################################
+    //  SISTEMA DE MISIONES
+    // ##########################################################
+
+    class Objetivo
+    {
+        public string Descripcion { get; }
+        public bool Completado { get; set; }
+        public Objetivo(string descripcion) { Descripcion = descripcion; }
+    }
+
+    class Mision
+    {
+        public string Nombre { get; }
+        public int RecompensaXP { get; }
+        public bool RecompensaEntregada { get; set; }
+        public List<Objetivo> Objetivos { get; } = new List<Objetivo>();
+        public bool Completada { get { return Objetivos.All(o => o.Completado); } }
+
+        public Mision(string nombre, int xp, params string[] objetivos)
+        {
+            Nombre = nombre;
+            RecompensaXP = xp;
+            foreach (string o in objetivos) Objetivos.Add(new Objetivo(o));
+        }
+
+        // El último objetivo (extracción) exige haber cumplido los anteriores.
+        public bool Marcar(int indice)
+        {
+            if (indice < 0 || indice >= Objetivos.Count) return false;
+            if (Objetivos[indice].Completado) return false;
+            if (indice == Objetivos.Count - 1 && Objetivos.Take(indice).Any(o => !o.Completado)) return false;
+            Objetivos[indice].Completado = true;
+            return true;
+        }
+
+        public void Mostrar()
+        {
+            Console.WriteLine($"Misión: \"{Nombre}\"");
+            foreach (Objetivo o in Objetivos)
+                Console.WriteLine($"  {(o.Completado ? "☑" : "☐")} {o.Descripcion}");
+        }
+    }
+
+    // ##########################################################
+    //  EXPLORADOR (Cadete controlado por el jugador)
+    // ##########################################################
+
+    class Explorador : Cadete
+    {
+        public const int EDAD_MINIMA = 15;
+
+        public const int ENERGIA_MIN_INGRESO = 30;
+        public const int ESTABILIDAD_MIN_INGRESO = 40;
+
+        public const int ENERGIA_MIN_EXPLORAR = 25;
+        public const int ENERGIA_MIN_ANALIZAR = 15;
+
+        public const int ESTABILIDAD_CRITICA = 20;
+
+        public const int VALOR_MAXIMO = 100;
+        public const int VALOR_MINIMO = 0;
+
+        public const int PELIGRO_ALTO = 60;
+        public const int ESTABILIDAD_COLAPSO = 25;
+        public const int ESTABILIDAD_RESONANCIA = 80;
+        public const int PELIGRO_RESONANCIA = 10;
+        public const int FRAGMENTOS_PARA_PROTOCOLO = 3;
+
+        public int Edad { get; }
+
+        public RealidadDimensional RealidadActual { get; private set; }
+        public string Realidad { get { return RealidadActual.Nombre; } }
+        public int ViajesRealizados { get; private set; }
+
+        public int Energia { get; private set; }
+        public int Estabilidad { get; private set; }
+        public bool Conectado { get; set; }
+
+        public int NivelPeligro { get; private set; }
+        public int FragmentosRecuperados { get; private set; }
+        public bool ProtocoloDescubierto { get; private set; }
+
+        public event Action<Explorador> AnomaliaDetectada;
+        public event Action<Explorador> ColapsoDetectado;
+
+        public Explorador(string nombre, int edad, RealidadDimensional realidad, int energia, int estabilidad)
+            : base(nombre, 100, 12)
+        {
+            if (realidad == null)
+                throw new ArgumentNullException(nameof(realidad));
+
+            Edad = edad;
+            RealidadActual = realidad;
+            Energia = energia;
+            Estabilidad = estabilidad;
+            Conectado = true;
+        }
+
+        public void CambiarRealidad(RealidadDimensional destino)
+        {
+            if (destino == null)
+                throw new ArgumentNullException(nameof(destino));
+
+            RealidadActual = destino;
+            ViajesRealizados++;
+        }
+
+        private static int Limitar(int valor)
+        {
+            if (valor > VALOR_MAXIMO) return VALOR_MAXIMO;
+            if (valor < VALOR_MINIMO) return VALOR_MINIMO;
+            return valor;
+        }
+
+        public void AjustarEnergia(int delta) { Energia = Limitar(Energia + delta); }
+        public void AjustarEstabilidad(int delta) { Estabilidad = Limitar(Estabilidad + delta); }
+        public void AjustarPeligro(int delta) { NivelPeligro = Limitar(NivelPeligro + delta); }
+
+        public void RegistrarFragmento()
+        {
+            FragmentosRecuperados++;
+            if (FragmentosRecuperados >= FRAGMENTOS_PARA_PROTOCOLO)
+                ProtocoloDescubierto = true;
+        }
+
+        public void DispararAnomaliaIris()
+        {
+            if (AnomaliaDetectada != null) AnomaliaDetectada(this);
+        }
+
+        public void DispararColapsoDimensional()
+        {
+            if (ColapsoDetectado != null) ColapsoDetectado(this);
+        }
+    }
+
+    // ##########################################################
+    //  PROGRAMA PRINCIPAL
+    // ##########################################################
+
+    class Program
+    {
+        static Random rng = Azar.Rng;
+
+        static int advertenciasCriticas = 0;
+        static int colapsosDetectados = 0;
+
+        public static readonly object ConsoleLock = new object();
+
+        static IrisConsola iris = new IrisConsola();
+        static List<RealidadDimensional> catalogoRealidades = new List<RealidadDimensional>();
+
+        static Mision misionActual;
+        static Personaje entidadActual; // null cuando no hay ninguna entidad cerca
+
+        static void Main(string[] args)
+        {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+            MostrarBienvenida();
+
+            iris.Iniciar();
+            if (iris.Activo)
+                EscribirColor("Canal con la CONSOLA IRIS establecido (sockets TCP, localhost).\n", ConsoleColor.DarkMagenta);
+            else
+                EscribirColor("No se pudo establecer el canal con la CONSOLA IRIS. NEXUS continúa sin notificaciones remotas.\n", ConsoleColor.DarkGray);
+
+            // ---------- Registro del cadete ----------
+            string nombre = LeerTexto("Nombre del Explorador: ");
+            int edad = LeerEnteroEnRango("Edad: ", 1, 120);
+            string nombreRealidad = LeerTexto("Realidad asignada: ");
+            int energiaInicial = LeerEnteroEnRango("Nivel de energía inicial (0-100): ", 0, 100);
+            int estabilidadInicial = LeerEnteroEnRango("Nivel de estabilidad de conexión inicial (0-100): ", 0, 100);
+
+            // ---------- Realidades ----------
+            RealidadDimensional realidadAsignada = new RealidadDimensional(nombreRealidad, 10, 6);
+            RealidadDimensional nexoFracturado = new RealidadDimensional("Nexo Fracturado", 45, 12);
+            RealidadDimensional jardinEco = new RealidadDimensional("Jardín de Eco", 5, 3);
+
+            catalogoRealidades.Add(realidadAsignada);
+            catalogoRealidades.Add(nexoFracturado);
+            catalogoRealidades.Add(jardinEco);
+
+            foreach (RealidadDimensional r in catalogoRealidades)
+                r.EstadoCambiado += ManejarCambioEstadoRealidad;
+
+            Explorador explorador = new Explorador(nombre, edad, realidadAsignada, energiaInicial, estabilidadInicial);
+            explorador.AnomaliaDetectada += ManejarAlertaIris;
+            explorador.ColapsoDetectado += ManejarColapsoDimensional;
+
+            // ---------- Autorización ----------
+            if (!EvaluarAutorizacion(explorador))
+            {
+                Console.WriteLine("\nNEXUS no puede autorizar el inicio de la inmersión en este momento.");
+                Console.WriteLine("Vuelve a intentarlo cuando cumplas los requisitos mínimos.\n");
+                iris.Cerrar();
+                return;
+            }
+
+            Console.WriteLine($"\n✓ Autorización concedida, Explorador {explorador.Nombre}.");
+            Console.WriteLine($"Iniciando conexión con la realidad: {explorador.Realidad}...\n");
+            iris.Enviar($"NEXUS reporta ingreso autorizado del Explorador {explorador.Nombre} a la realidad {explorador.Realidad}.");
+
+            Console.WriteLine("NEXUS registra las siguientes realidades en su catálogo:");
+            MostrarCatalogoRealidades(explorador);
+
+            IniciarJuego(explorador);
+
+            // ---------- Ciclo principal ----------
+            while (explorador.Conectado)
+            {
+                MostrarMenu(explorador);
+
+                try
+                {
+                    int opcion = LeerEntero("Seleccione una operación: ");
+
+                    if (opcion < 1 || opcion > 9)
+                        throw new OperacionInvalidaException($"La operación {opcion} no existe en el sistema NEXUS.");
+
+                    switch (opcion)
+                    {
+                        case 1: ExplorarRealidad(explorador); break;
+                        case 2: AnalizarAnomalia(explorador); break;
+                        case 3: ConsultarEstado(explorador); break;
+                        case 4: RecuperarEnergia(explorador); break;
+                        case 5: IntentarDesconexion(explorador); break;
+                        case 6: ViajarEntreRealidades(explorador); break;
+                        case 7: GestionarInventario(explorador); break;
+                        case 8: MostrarMision(); break;
+                        case 9: AtacarFueraDeEncuentro(); break;
+                    }
+                }
+                catch (OperacionInvalidaException ex)
+                {
+                    EscribirColor($"\n⚠ {ex.Message} Elige una opción entre 1 y 9.\n", ConsoleColor.Yellow);
+                }
+                catch (Exception ex)
+                {
+                    EscribirColor($"\n⚠ NEXUS detectó un error inesperado: {ex.Message}\n", ConsoleColor.Red);
+                }
+
+                if (explorador.Conectado)
+                {
+                    VerificarResonanciaEstable(explorador);
+                    VerificarCondicionCritica(explorador);
+                    VerificarColapsoDimensional(explorador);
+                }
+            }
+
+            FinalizarJuego(explorador);
+
+            iris.Enviar($"NEXUS reporta cierre de sesión del Explorador {explorador.Nombre}.");
+            iris.Cerrar();
+
+            Console.WriteLine("\n════════════════════════════════════════");
+            Console.WriteLine("   SESIÓN FINALIZADA - ENLACE CERRADO");
+            Console.WriteLine("════════════════════════════════════════\n");
+        }
+
+        // ================= Interfaz =================
+
+        static void MostrarBienvenida()
+        {
+            Console.WriteLine("════════════════════════════════════════");
+            Console.WriteLine("       SISTEMA NEXUS - MÓDULO DE");
+            Console.WriteLine("     ENTRENAMIENTO DE EXPLORADORES");
+            Console.WriteLine("════════════════════════════════════════\n");
+            Console.WriteLine("Antes de autorizar la inmersión, NEXUS necesita registrar tus datos.\n");
+        }
+
+        static void MostrarMenu(Explorador e)
+        {
+            Console.WriteLine("\n════════════════════════════════════════");
+            Console.WriteLine("        NEXUS TRAINING SYSTEM");
+            Console.WriteLine("════════════════════════════════════════");
+            Console.WriteLine($"EXPLORADOR:  {e.Nombre}");
+            Console.WriteLine($"REALIDAD:    {e.Realidad} ({e.RealidadActual.Estado})");
+
+            MostrarBarra("VIDA       ", e.Vida, 30, 60);
+            MostrarBarra("ENERGÍA    ", e.Energia, 30, 60);
+            MostrarBarra("ESTABILIDAD", e.Estabilidad, Explorador.ESTABILIDAD_CRITICA, 50);
+            MostrarBarra("PELIGRO    ", e.NivelPeligro, 100, 100, invertido: true, umbralBajo: 30, umbralAlto: Explorador.PELIGRO_ALTO);
+
+            Console.WriteLine($"NIVEL: {e.Nivel} | XP: {e.XP} | ESCUDO: {e.Escudo} | INVENTARIO: {e.Inventario.Total}/{Inventario.CAPACIDAD}");
+            if (misionActual != null)
+            {
+                int hechos = misionActual.Objetivos.Count(o => o.Completado);
+                Console.WriteLine($"MISIÓN:      {misionActual.Nombre} ({hechos}/{misionActual.Objetivos.Count})" +
+                                  (misionActual.Completada ? " ✔" : ""));
+            }
+
+            if (e.ProtocoloDescubierto)
+                EscribirColor("PROTOCOLO DE ESCAPE: DESCUBIERTO", ConsoleColor.Cyan);
+
+            Console.WriteLine("ESTADO:      CONECTADO");
+            Console.WriteLine("════════════════════════════════════════");
+            Console.WriteLine("1. Explorar realidad");
+            Console.WriteLine("2. Analizar anomalía");
+            Console.WriteLine("3. Consultar estado");
+            Console.WriteLine("4. Recuperar energía");
+            Console.WriteLine("5. Intentar desconexión");
+            Console.WriteLine("6. Viajar entre realidades");
+            Console.WriteLine("7. Inventario");
+            Console.WriteLine("8. Ver misión");
+            Console.WriteLine("9. Atacar");
+            Console.WriteLine();
+        }
+
+        static void MostrarBarra(string etiqueta, int valor, int umbralCritico, int umbralAdvertencia,
+            bool invertido = false, int umbralBajo = 0, int umbralAlto = 0)
+        {
+            int bloques = Math.Max(0, Math.Min(10, valor / 10));
+            string barra = new string('█', bloques) + new string('░', 10 - bloques);
+
+            ConsoleColor color;
+            if (!invertido)
+            {
+                if (valor < umbralCritico) color = ConsoleColor.Red;
+                else if (valor < umbralAdvertencia) color = ConsoleColor.Yellow;
+                else color = ConsoleColor.Green;
+            }
+            else
+            {
+                if (valor >= umbralAlto) color = ConsoleColor.Red;
+                else if (valor >= umbralBajo) color = ConsoleColor.Yellow;
+                else color = ConsoleColor.Green;
+            }
+
+            Console.Write($"{etiqueta} [");
+            EscribirColor(barra, color, salto: false);
+            Console.WriteLine($"] {valor}/100");
+        }
+
+        static void EscribirColor(string mensaje, ConsoleColor color, bool salto = true)
+        {
+            lock (ConsoleLock)
+            {
+                ConsoleColor original = Console.ForegroundColor;
+                Console.ForegroundColor = color;
+                if (salto) Console.WriteLine(mensaje);
+                else Console.Write(mensaje);
+                Console.ForegroundColor = original;
+            }
+        }
+
+        static void MostrarEscaneoProgreso(string titulo)
+        {
+            Console.WriteLine($"\n{titulo}");
+            Console.Write("[");
+            for (int i = 0; i < 20; i++)
+            {
+                Thread.Sleep(25);
+                Console.Write("█");
+            }
+            Console.WriteLine("] 100%");
+        }
+
+        // ================= Mapas (matrices) =================
+        //   .  vacío (puede producir eventos)
+        //   #  obstáculo
+        //   $  depósito de energía
+        //   ~  zona de inestabilidad dimensional
+        //   A  anomalía (custodiada por una entidad)
+        //   N  núcleo energético (objetivo de misión)
+        //   S  punto de salida / extracción
+        // ====================================================
+
+        static char[,] ObtenerMapa(string realidad)
+        {
+            string[][] plantillas = new string[][]
+            {
+                new string[] { "........", "..##..$.", "..#A..#.", "....~..#", "..#...S.", "........" },
+                new string[] { "..$.....", ".###..~.", "....A..#", "..~..##.", ".#....S.", "........" },
+                new string[] { "....#...", ".$..#.~.", "..A....#", ".##..#..", "....S...", "...~...." }
+            };
+
+            // Hash determinista (GetHashCode de string varía entre ejecuciones).
+            int hash = 0;
+            foreach (char ch in realidad) hash = (hash * 31 + ch) & 0x7FFFFFFF;
+
+            string[] plantilla = plantillas[hash % plantillas.Length];
+            int filas = plantilla.Length;
+            int columnas = plantilla[0].Length;
+            char[,] mapa = new char[filas, columnas];
+
+            for (int f = 0; f < filas; f++)
+                for (int c = 0; c < columnas; c++)
+                    mapa[f, c] = plantilla[f][c];
+
+            return mapa;
+        }
+
+        // Coloca el núcleo energético (N) mientras ese objetivo siga pendiente.
+        static void ColocarNucleo(char[,] mapa)
+        {
+            if (misionActual == null || misionActual.Objetivos[1].Completado) return;
+
+            for (int f = 2; f < mapa.GetLength(0); f++)
+                for (int c = 3; c < mapa.GetLength(1); c++)
+                    if (mapa[f, c] == '.')
+                    {
+                        mapa[f, c] = 'N';
+                        return;
+                    }
+        }
+
+        static void DibujarMapa(char[,] mapa, int filaJugador, int colJugador)
+        {
+            int filas = mapa.GetLength(0);
+            int columnas = mapa.GetLength(1);
+
+            Console.WriteLine();
+            for (int f = 0; f < filas; f++)
+            {
+                for (int c = 0; c < columnas; c++)
+                {
+                    if (f == filaJugador && c == colJugador)
+                    {
+                        EscribirColor("J", ConsoleColor.Cyan, salto: false);
+                        continue;
+                    }
+
+                    char casilla = mapa[f, c];
+                    ConsoleColor color = ConsoleColor.Gray;
+
+                    if (casilla == '#') color = ConsoleColor.DarkGray;
+                    else if (casilla == '$') color = ConsoleColor.Green;
+                    else if (casilla == '~') color = ConsoleColor.Yellow;
+                    else if (casilla == 'A') color = ConsoleColor.Magenta;
+                    else if (casilla == 'N') color = ConsoleColor.DarkYellow;
+                    else if (casilla == 'S') color = ConsoleColor.Cyan;
+
+                    EscribirColor(casilla.ToString(), color, salto: false);
+                }
+                Console.WriteLine();
+            }
+            Console.WriteLine();
+        }
+
+        static void ExplorarMapa(Explorador e)
+        {
+            char[,] mapa = ObtenerMapa(e.Realidad);
+            ColocarNucleo(mapa);
+
+            int filas = mapa.GetLength(0);
+            int columnas = mapa.GetLength(1);
+
+            int filaJugador = 0;
+            int colJugador = 0;
+
+            for (int f = 0; f < filas; f++)
+            {
+                if (mapa[f, 0] != '#')
+                {
+                    filaJugador = f;
+                    break;
+                }
+            }
+
+            int movimientosRestantes = e.Energia >= 70 ? 14 : 12;
+            bool salioPorSalida = false;
+
+            Console.WriteLine("\nTe internas en el sector explorable de la realidad.");
+            Console.WriteLine("Muévete con W (arriba) / A (izquierda) / S (abajo) / D (derecha). Q para retirarte.");
+            Console.WriteLine("Leyenda: A anomalía | N núcleo | S extracción | $ energía | ~ inestable | # obstáculo");
+
+            while (movimientosRestantes > 0 && e.Energia > 0 && e.Conectado)
+            {
+                DibujarMapa(mapa, filaJugador, colJugador);
+                Console.WriteLine($"Movimientos restantes: {movimientosRestantes} | Energía: {e.Energia} | Estabilidad: {e.Estabilidad} | Vida: {e.Vida}");
+                Console.Write("Movimiento (W/A/S/D/Q): ");
+                string tecla = (Console.ReadLine() ?? "").Trim().ToLower();
+
+                int nuevaFila = filaJugador;
+                int nuevaCol = colJugador;
+
+                if (tecla == "w") nuevaFila--;
+                else if (tecla == "s") nuevaFila++;
+                else if (tecla == "a") nuevaCol--;
+                else if (tecla == "d") nuevaCol++;
+                else if (tecla == "q")
+                {
+                    Console.WriteLine("Te retiras del sector explorado.");
+                    break;
+                }
+                else
+                {
+                    Console.WriteLine("Movimiento no reconocido. Usa W, A, S, D o Q.");
+                    continue;
+                }
+
+                if (nuevaFila < 0 || nuevaFila >= filas || nuevaCol < 0 || nuevaCol >= columnas)
+                {
+                    Console.WriteLine("No puedes salir de los límites del sector explorado.");
+                    continue;
+                }
+
+                if (mapa[nuevaFila, nuevaCol] == '#')
+                {
+                    Console.WriteLine("Un obstáculo dimensional bloquea el paso.");
+                    continue;
+                }
+
+                filaJugador = nuevaFila;
+                colJugador = nuevaCol;
+                movimientosRestantes--;
+
+                char casilla = mapa[filaJugador, colJugador];
+
+                if (casilla == '$')
+                {
+                    EscribirColor("Encuentras un depósito de energía residual.", ConsoleColor.Green);
+                    e.AjustarEnergia(15);
+                    mapa[filaJugador, colJugador] = '.';
+                }
+                else if (casilla == '~')
+                {
+                    EscribirColor("Pisas una zona de inestabilidad dimensional.", ConsoleColor.Yellow);
+                    e.AjustarEstabilidad(-10);
+                    e.AjustarPeligro(10);
+                }
+                else if (casilla == 'A')
+                {
+                    Console.WriteLine("Detectas una anomalía en esta casilla.");
+                    ProgresoMision(e, 0);
+                    Console.WriteLine("Algo custodia la anomalía...");
+                    Encuentro(e);
+                    if (!e.Conectado) break;
+
+                    if (rng.Next(1, 101) <= 50)
+                    {
+                        EscribirColor("Se ha recuperado un fragmento de información sobre IRIS.", ConsoleColor.Cyan);
+                        e.RegistrarFragmento();
+                    }
+                    mapa[filaJugador, colJugador] = '.';
+                }
+                else if (casilla == 'N')
+                {
+                    EscribirColor("⚡ Encuentras el núcleo energético. Su energía te recorre (+10).", ConsoleColor.Yellow);
+                    e.AjustarEnergia(10);
+                    mapa[filaJugador, colJugador] = '.';
+                    ProgresoMision(e, 1);
+                }
+                else if (casilla == 'S')
+                {
+                    EscribirColor("Alcanzas un punto de salida estable. El recorrido concluye.", ConsoleColor.Green);
+                    e.AjustarEstabilidad(10);
+                    ProgresoMision(e, 3);
+                    salioPorSalida = true;
+                    break;
+                }
+                else if (casilla == '.')
+                {
+                    // Casilla vacía: puede producir un evento de exploración.
+                    if (rng.Next(1, 101) <= 25) ResolverEventoZona(e);
+                    if (!e.Conectado) break;
+                }
+            }
+
+            if (!salioPorSalida && movimientosRestantes == 0)
+                Console.WriteLine("Se agotó el margen de movimientos en este sector.");
+        }
+
+        // ================= Evaluación de ingreso =================
+
+        static bool EvaluarAutorizacion(Explorador e)
+        {
+            bool autorizado = true;
+            Console.WriteLine("\nNEXUS está evaluando tus condiciones de ingreso...\n");
+
+            if (e.Edad < Explorador.EDAD_MINIMA)
+            {
+                Console.WriteLine($"✗ Edad insuficiente. Se requieren al menos {Explorador.EDAD_MINIMA} años.");
+                autorizado = false;
+            }
+            if (e.Energia < Explorador.ENERGIA_MIN_INGRESO)
+            {
+                Console.WriteLine($"✗ Energía insuficiente. Se requiere un mínimo de {Explorador.ENERGIA_MIN_INGRESO}.");
+                autorizado = false;
+            }
+            if (e.Estabilidad < Explorador.ESTABILIDAD_MIN_INGRESO)
+            {
+                Console.WriteLine($"✗ Estabilidad de conexión insuficiente. Se requiere un mínimo de {Explorador.ESTABILIDAD_MIN_INGRESO}.");
+                autorizado = false;
+            }
+
+            if (autorizado)
+                Console.WriteLine("✓ Todas las condiciones se cumplen.");
+
+            return autorizado;
+        }
+
+        // ================= Operaciones del menú =================
+
+        static void ExplorarRealidad(Explorador e)
+        {
+            Console.WriteLine("\n--- EXPLORAR REALIDAD ---");
+
+            if (e.Energia < Explorador.ENERGIA_MIN_EXPLORAR)
+            {
+                EscribirColor($"⚠ Energía insuficiente. Necesitas al menos {Explorador.ENERGIA_MIN_EXPLORAR} de energía para explorar.", ConsoleColor.Yellow);
+                Console.WriteLine("NEXUS sugiere usar la opción 4 (o una célula de energía) para recuperar energía.");
+                return;
+            }
+
+            if (e.NivelPeligro >= Explorador.PELIGRO_ALTO)
+            {
+                EscribirColor("\n⚠ ADVERTENCIA: el nivel de peligro es alto. Explorar ahora es arriesgado.", ConsoleColor.Yellow);
+                Console.Write("¿Deseas continuar de todos modos? (s/n): ");
+                string respuesta = (Console.ReadLine() ?? "").Trim().ToLower();
+                if (respuesta != "s")
+                {
+                    Console.WriteLine("Exploración cancelada. NEXUS mantiene la posición actual.");
+                    return;
+                }
+            }
+
+            MostrarEscaneoProgreso("Escaneando la realidad...");
+
+            // Fase 1: recorrido del sector (matriz, encuentros y eventos).
+            ExplorarMapa(e);
+
+            if (!e.Conectado) return; // murió o fue desconectado durante el recorrido
+
+            if (e.Energia <= 0)
+            {
+                EscribirColor("\nTe has quedado sin energía. NEXUS interrumpe la exploración.", ConsoleColor.Red);
+                return;
+            }
+
+            // Fase 2: desenlace general de la expedición.
+            int costoEnergia = rng.Next(15, 26);
+            int cambioEstabilidad = rng.Next(-15, 6);
+
+            e.AjustarEnergia(-costoEnergia);
+            e.AjustarEstabilidad(cambioEstabilidad);
+
+            Console.WriteLine($"\nHas explorado una zona desconocida de {e.Realidad}.");
+            Console.WriteLine($"Energía consumida: {costoEnergia}");
+
+            if (e.Energia >= 70 && e.Estabilidad >= 70)
+            {
+                EscribirColor("La sincronía con la realidad es excelente. Exploración óptima.", ConsoleColor.Green);
+                e.AjustarPeligro(-5);
+            }
+            else if (e.Energia < 30 || e.Estabilidad < 30)
+            {
+                if (e.Estabilidad < Explorador.ESTABILIDAD_CRITICA)
+                {
+                    EscribirColor("La conexión se sacude violentamente. Zona extremadamente inestable.", ConsoleColor.Red);
+                    e.AjustarPeligro(20);
+                }
+                else
+                {
+                    EscribirColor("La exploración fue tensa. La zona no es del todo segura.", ConsoleColor.Yellow);
+                    e.AjustarPeligro(10);
+                }
+            }
+            else
+            {
+                Console.WriteLine(cambioEstabilidad >= 0
+                    ? $"La conexión se sintió estable. Estabilidad +{cambioEstabilidad}"
+                    : $"La conexión sufrió turbulencias. Estabilidad {cambioEstabilidad}");
+            }
+
+            // Fase 3: la realidad (objeto) reacciona y cobra su costo.
+            AplicarEfectosDeRealidad(e);
+        }
+
+        static void AplicarEfectosDeRealidad(Explorador e)
+        {
+            RealidadDimensional r = e.RealidadActual;
+
+            r.RegistrarExploracion();
+
+            int extraEnergia = r.ObtenerCostoExtraEnergia();
+            int perdidaEstabilidad = r.ObtenerPerdidaEstabilidad();
+
+            if (extraEnergia > 0 || perdidaEstabilidad > 0)
+            {
+                EscribirColor($"\n{r.Nombre} se encuentra {r.Estado.ToString().ToUpper()}: " +
+                              $"-{extraEnergia} energía, -{perdidaEstabilidad} estabilidad.", ConsoleColor.Yellow);
+                e.AjustarEnergia(-extraEnergia);
+                e.AjustarEstabilidad(-perdidaEstabilidad);
+            }
+
+            Console.WriteLine($"Estado de la realidad: {r.Describir()}");
+        }
+
+        static void AnalizarAnomalia(Explorador e)
+        {
+            Console.WriteLine("\n--- ANALIZAR ANOMALÍA ---");
+
+            if (e.Energia < Explorador.ENERGIA_MIN_ANALIZAR)
+            {
+                EscribirColor($"⚠ No tienes suficiente energía para analizar anomalías (mínimo {Explorador.ENERGIA_MIN_ANALIZAR}).", ConsoleColor.Yellow);
+                return;
+            }
+
+            e.AjustarEnergia(-10);
+
+            if (e.Estabilidad < 20)
+            {
+                Console.WriteLine("NEXUS fuerza un análisis profundo pese a la inestabilidad de la conexión...");
+                e.AjustarPeligro(15);
+                if (rng.Next(1, 101) <= 85)
+                {
+                    EscribirColor("Análisis inestable: se ha recuperado un fragmento de información sobre IRIS.", ConsoleColor.Cyan);
+                    e.RegistrarFragmento();
+                }
+                else
+                {
+                    Console.WriteLine("El análisis colapsó antes de arrojar resultados.");
+                }
+            }
+            else if (e.Estabilidad < 60)
+            {
+                Console.WriteLine("NEXUS detecta un patrón inusual en la anomalía...");
+                if (rng.Next(1, 101) <= 40)
+                {
+                    EscribirColor("Se ha recuperado un fragmento de información sobre IRIS.", ConsoleColor.Cyan);
+                    e.RegistrarFragmento();
+                }
+                else
+                {
+                    Console.WriteLine("El análisis no arrojó resultados relevantes esta vez.");
+                }
+            }
+            else
+            {
+                Console.WriteLine("La conexión es estable. NEXUS realiza un análisis limpio y seguro.");
+                e.AjustarEstabilidad(2);
+                EscribirColor("Se ha recuperado un fragmento de información sobre IRIS.", ConsoleColor.Cyan);
+                e.RegistrarFragmento();
+            }
+
+            if (e.ProtocoloDescubierto)
+            {
+                EscribirColor("\nNEXUS susurra: \"El Protocolo de Escape ya es tuyo, Explorador.\"", ConsoleColor.Cyan);
+                iris.Enviar($"NEXUS informa: el Explorador {e.Nombre} ha descubierto el Protocolo de Escape.");
+            }
+        }
+
+        static void ConsultarEstado(Explorador e)
+        {
+            Console.WriteLine("\n--- ESTADO ACTUAL DEL EXPLORADOR ---");
+            Console.WriteLine($"Nombre:      {e.Nombre}");
+            Console.WriteLine($"Edad:        {e.Edad}");
+            Console.WriteLine($"Realidad:    {e.Realidad}");
+            Console.WriteLine($"Vida:        {e.Vida}/{e.VidaMax}");
+            Console.WriteLine($"Energía:     {e.Energia}/100");
+            Console.WriteLine($"Estabilidad: {e.Estabilidad}/100");
+            Console.WriteLine($"Peligro:     {e.NivelPeligro}/100");
+            Console.WriteLine($"Nivel:       {e.Nivel} (XP: {e.XP}) | Ataque: {e.Ataque} | Escudo: {e.Escudo}");
+            Console.WriteLine($"Fragmentos IRIS recolectados: {e.FragmentosRecuperados}");
+            Console.WriteLine($"Protocolo de Escape: {(e.ProtocoloDescubierto ? "DESCUBIERTO" : "desconocido")}");
+            Console.WriteLine($"Viajes entre realidades: {e.ViajesRealizados}");
+            Console.WriteLine($"Estado de la realidad: {e.RealidadActual.Describir()}");
+            e.Inventario.Consultar();
+        }
+
+        static void RecuperarEnergia(Explorador e)
+        {
+            Console.WriteLine("\n--- RECUPERAR ENERGÍA ---");
+
+            if (e.NivelPeligro >= Explorador.PELIGRO_ALTO)
+            {
+                if (e.Estabilidad < Explorador.ESTABILIDAD_CRITICA)
+                {
+                    EscribirColor("NEXUS interrumpe el descanso: el peligro y la inestabilidad no dan tregua.", ConsoleColor.Red);
+                    e.AjustarEnergia(5);
+                    e.AjustarPeligro(10);
+                }
+                else
+                {
+                    EscribirColor("El descanso es breve e incómodo; el peligro sigue latente.", ConsoleColor.Yellow);
+                    e.AjustarEnergia(10);
+                    e.AjustarPeligro(5);
+                }
+                return;
+            }
+
+            int energiaAntes = e.Energia;
+            e.AjustarEnergia(20);
+            e.AjustarEstabilidad(5);
+            int recuperadoReal = e.Energia - energiaAntes;
+
+            if (recuperadoReal < 20)
+                Console.WriteLine($"Energía recuperada: {recuperadoReal} (se alcanzó el límite máximo de 100).");
+            else
+                Console.WriteLine($"Energía recuperada: {recuperadoReal}.");
+
+            Console.WriteLine("La pausa también ayudó a estabilizar ligeramente la conexión.");
+
+            e.RealidadActual.Estabilizar(8);
+            Console.WriteLine($"La realidad {e.Realidad} se calma un poco (inestabilidad: {e.RealidadActual.NivelInestabilidad}/100).");
+        }
+
+        static void IntentarDesconexion(Explorador e)
+        {
+            Console.WriteLine("\n--- INTENTO DE DESCONEXIÓN ---");
+
+            if (e.ProtocoloDescubierto)
+            {
+                EscribirColor("NEXUS activa el Protocolo de Escape descubierto. Desconexión segura garantizada.", ConsoleColor.Cyan);
+            }
+            else if (e.Estabilidad < Explorador.ESTABILIDAD_CRITICA)
+            {
+                EscribirColor("⚠ La conexión es demasiado inestable para una desconexión segura.", ConsoleColor.Red);
+                Console.WriteLine("NEXUS ejecuta un protocolo de desconexión de emergencia.");
+            }
+            else
+            {
+                Console.WriteLine("Desconexión autorizada. Cerrando enlace neuronal de forma segura.");
+            }
+
+            e.Conectado = false;
+        }
+
+        // ================= Viajes entre realidades =================
+
+        static void MostrarCatalogoRealidades(Explorador e)
+        {
+            for (int i = 0; i < catalogoRealidades.Count; i++)
+            {
+                RealidadDimensional r = catalogoRealidades[i];
+                string marca = ReferenceEquals(r, e.RealidadActual) ? " <- ubicación actual" : "";
+                Console.WriteLine($"  {i + 1}. {r.Describir()} | Costo de viaje: {r.ObtenerCostoViaje()} energía{marca}");
+            }
+        }
+
+        static void ViajarEntreRealidades(Explorador e)
+        {
+            Console.WriteLine("\n--- VIAJAR ENTRE REALIDADES ---");
+            MostrarCatalogoRealidades(e);
+            Console.Write("Elige la realidad destino (0 para cancelar): ");
+
+            string entrada = Console.ReadLine() ?? "";
+            int eleccion;
+            if (!int.TryParse(entrada, out eleccion) || eleccion < 0 || eleccion > catalogoRealidades.Count)
+            {
+                EscribirColor("Destino no válido. NEXUS cancela el salto.", ConsoleColor.Yellow);
+                return;
+            }
+            if (eleccion == 0)
+            {
+                Console.WriteLine("Viaje cancelado.");
+                return;
+            }
+
+            RealidadDimensional destino = catalogoRealidades[eleccion - 1];
+
+            if (ReferenceEquals(destino, e.RealidadActual))
+            {
+                Console.WriteLine("Ya te encuentras en esa realidad.");
+                return;
+            }
+
+            int costo = destino.ObtenerCostoViaje();
+            if (e.Energia < costo)
+            {
+                EscribirColor($"Energía insuficiente para el salto. Se requieren {costo} y tienes {e.Energia}.", ConsoleColor.Yellow);
+                return;
+            }
+
+            RealidadDimensional origen = e.RealidadActual;
+
+            MostrarEscaneoProgreso($"Calibrando salto dimensional hacia {destino.Nombre}...");
+            e.AjustarEnergia(-costo);
+            e.CambiarRealidad(destino);
+            origen.Estabilizar(5);
+
+            EscribirColor($"Has llegado a {destino.Nombre}. Energía consumida: {costo}.", ConsoleColor.Cyan);
+            Console.WriteLine($"Estado de la realidad: {destino.Describir()}");
+            iris.Enviar($"NEXUS reporta que el Explorador {e.Nombre} viajó de {origen.Nombre} a {destino.Nombre}.");
+        }
+
+        static void ManejarCambioEstadoRealidad(RealidadDimensional r, EstadoRealidad anterior, EstadoRealidad nuevo)
+        {
+            ConsoleColor color = nuevo == EstadoRealidad.Critica ? ConsoleColor.Red
+                               : nuevo == EstadoRealidad.Inestable ? ConsoleColor.Yellow
+                               : ConsoleColor.Green;
+
+            EscribirColor($"\n⟳ La realidad {r.Nombre} cambió de estado: {anterior} → {nuevo}", color);
+            iris.Enviar($"La realidad {r.Nombre} cambió de estado: {anterior} -> {nuevo}.");
+        }
+
+        // ================= Inicio, fin y misión =================
+
+        static void IniciarJuego(Explorador e)
+        {
+            e.Inventario.Agregar(Objeto.Crear(TipoObjeto.Celula));
+            e.Inventario.Agregar(Objeto.Crear(TipoObjeto.Escudo));
+            e.Inventario.Agregar(Objeto.Crear(TipoObjeto.Analizador));
+
+            misionActual = new Mision("La anomalía perdida", 100,
+                "Llegar a la zona de anomalía (A)",
+                "Encontrar el núcleo energético (N)",
+                "Sobrevivir al encuentro con la entidad",
+                "Regresar al punto de extracción (S)");
+
+            EscribirColor("\n📋 NUEVA MISIÓN ASIGNADA", ConsoleColor.Cyan);
+            misionActual.Mostrar();
+            Console.WriteLine("Inventario inicial: célula de energía, escudo y analizador.");
+            iris.Enviar($"NEXUS asigna la misión \"{misionActual.Nombre}\" al Explorador {e.Nombre}.");
+        }
+
+        static void FinalizarJuego(Explorador e)
+        {
+            Console.WriteLine("\n──────── RESUMEN DE LA MISIÓN ────────");
+            Console.WriteLine(e.Describir());
+            Console.WriteLine($"XP total: {e.XP}");
+            if (!e.EstaVivo)
+                EscribirColor("🔴 MISIÓN FALLIDA: no lograste regresar con vida.", ConsoleColor.Red);
+            else if (misionActual != null && misionActual.Completada)
+                EscribirColor("🏆 Regresaste con vida y completaste la misión.", ConsoleColor.Green);
+            else
+                EscribirColor("Regresaste con vida, pero la misión quedó incompleta.", ConsoleColor.Yellow);
+        }
+
+        static void ProgresoMision(Explorador e, int indice)
+        {
+            if (misionActual == null || misionActual.Completada) return;
+
+            if (misionActual.Marcar(indice))
+            {
+                EscribirColor($"✔ Objetivo cumplido: {misionActual.Objetivos[indice].Descripcion}", ConsoleColor.Green);
+                if (misionActual.Completada) EntregarRecompensa(e);
+            }
+            else if (indice == misionActual.Objetivos.Count - 1 && !misionActual.Objetivos[indice].Completado)
+            {
+                EscribirColor("NEXUS: llegaste al punto de extracción, pero aún hay objetivos pendientes (opción 8).", ConsoleColor.Yellow);
+            }
+        }
+
+        static void EntregarRecompensa(Explorador e)
+        {
+            if (misionActual.RecompensaEntregada) return;
+            misionActual.RecompensaEntregada = true;
+
+            EscribirColor("\n🟢 MISIÓN COMPLETADA", ConsoleColor.Green);
+            Console.WriteLine($"+{misionActual.RecompensaXP} XP");
+            Console.WriteLine("+1 módulo desconocido");
+
+            bool subeNivel = e.GanarXP(misionActual.RecompensaXP);
+            e.Inventario.Agregar(Objeto.ModuloDesconocido(), true);
+
+            if (subeNivel)
+                EscribirColor($"⬆ ¡Subes al nivel {e.Nivel}! Ataque +2 y vida +15.", ConsoleColor.Cyan);
+
+            iris.Enviar($"MISIÓN COMPLETADA: \"{misionActual.Nombre}\" por el Explorador {e.Nombre}.");
+        }
+
+        static void MostrarMision()
+        {
+            Console.WriteLine("\n--- MISIÓN ACTUAL ---");
+            if (misionActual == null) Console.WriteLine("No tienes misión asignada.");
+            else misionActual.Mostrar();
+        }
+
+        // ================= Inventario (opción 7) =================
+
+        static void GestionarInventario(Explorador e)
+        {
+            while (true)
+            {
+                Console.WriteLine("\n--- INVENTARIO ---");
+                e.Inventario.Consultar();
+                Console.WriteLine("1. Utilizar objeto   2. Eliminar objeto   0. Volver");
+                Console.Write("Opción: ");
+                string op = (Console.ReadLine() ?? "").Trim();
+
+                try
+                {
+                    if (op == "0") return;
+
+                    if (op == "1")
+                    {
+                        Console.Write("Objeto a utilizar (número o nombre): ");
+                        Objeto o = e.Inventario.Buscar(Console.ReadLine());
+                        EscribirColor(e.Inventario.Utilizar(o, e, null), ConsoleColor.Cyan);
+                    }
+                    else if (op == "2")
+                    {
+                        Console.Write("Objeto a eliminar (número o nombre): ");
+                        Objeto o = e.Inventario.Buscar(Console.ReadLine());
+                        Console.Write($"¿Eliminar todas las unidades de {o.Nombre}? (s/n): ");
+                        if ((Console.ReadLine() ?? "").Trim().ToLower() == "s")
+                        {
+                            string nombre = o.Nombre;
+                            e.Inventario.Eliminar(o, o.Cantidad);
+                            Console.WriteLine($"{nombre} eliminado del inventario.");
+                        }
+                        else
+                        {
+                            Console.WriteLine("Eliminación cancelada.");
+                        }
+                    }
+                    else
+                    {
+                        throw new OperacionInvalidaException("Opción de inventario no válida. Elige 1, 2 o 0.");
+                    }
+                }
+                catch (OperacionInvalidaException ex)
+                {
+                    EscribirColor($"⚠ {ex.Message}", ConsoleColor.Yellow);
+                }
+            }
+        }
+
+        // ================= Atacar fuera de un encuentro (opción 9) =================
+
+        static void AtacarFueraDeEncuentro()
+        {
+            Console.WriteLine("\n--- ATACAR ---");
+            if (entidadActual == null || !entidadActual.EstaVivo)
+            {
+                EscribirColor("No hay ninguna entidad cerca a la que atacar. Explora para encontrarlas.", ConsoleColor.Yellow);
+                return;
+            }
+            Console.WriteLine("Usa las acciones del encuentro para combatir.");
+        }
+
+        // ================= Eventos de exploración =================
+
+        static void ResolverEventoZona(Explorador e)
+        {
+            int t = rng.Next(1, 101);
+
+            if (t <= 20)
+            {
+                EncontrarObjeto(e);
+            }
+            else if (t <= 45)
+            {
+                Encuentro(e);
+            }
+            else if (t <= 60)
+            {
+                EscribirColor("\n⚡ ANOMALÍA DETECTADA: la zona vibra. Estabilidad -8, peligro +8.", ConsoleColor.Magenta);
+                e.AjustarEstabilidad(-8);
+                e.AjustarPeligro(8);
+                if (rng.Next(1, 101) <= 30)
+                {
+                    EscribirColor("Entre la distorsión recuperas un fragmento de información sobre IRIS.", ConsoleColor.Cyan);
+                    e.RegistrarFragmento();
+                }
+            }
+            else if (t <= 72)
+            {
+                EscribirColor("\n🔋 PÉRDIDA DE ENERGÍA: una fuga drena tus reservas (-10).", ConsoleColor.Yellow);
+                e.AjustarEnergia(-10);
+            }
+            else if (t <= 82)
+            {
+                EscribirColor("\n🚨 SISTEMA DAÑADO: tu traje sufre una sobrecarga.", ConsoleColor.Red);
+                if (e.Escudo > 0)
+                {
+                    e.DesactivarEscudo();
+                    Console.WriteLine("Tu escudo se desintegra.");
+                }
+                e.AjustarEstabilidad(-10);
+                Console.WriteLine("Estabilidad -10.");
+            }
+            else if (t <= 92)
+            {
+                string[] pistas =
+                {
+                    "Un eco dice que IRIS observa a los Exploradores desde dentro.",
+                    "Una inscripción indica que el núcleo energético brilla cerca de la anomalía.",
+                    "Los registros sugieren que los robots son vulnerables al ser analizados."
+                };
+                EscribirColor($"\n📡 INFORMACIÓN ENCONTRADA: {pistas[rng.Next(pistas.Length)]}", ConsoleColor.Cyan);
+                e.GanarXP(5);
+            }
+            else
+            {
+                Console.WriteLine("\nLa zona está en calma. No encuentras nada.");
+            }
+        }
+
+        static void EncontrarObjeto(Explorador e)
+        {
+            Objeto o = Objeto.Aleatorio();
+            EscribirColor($"\n🎁 OBJETO ENCONTRADO: {o.Icono} {o.Nombre}", ConsoleColor.Green);
+            if (e.Inventario.Agregar(o))
+                Console.WriteLine("Guardado en tu inventario.");
+            else
+                EscribirColor("Inventario lleno: debes dejarlo atrás. Libera espacio con la opción 7.", ConsoleColor.Yellow);
+        }
+
+        // ================= Sistema de encuentros =================
+
+        static Personaje GenerarEntidad()
+        {
+            if (rng.Next(1, 101) <= 40)
+            {
+                string[] robots = { "Centinela-7", "Vigía Mecánico", "Dron Custodio" };
+                return new Robot(robots[rng.Next(robots.Length)]);
+            }
+            string[] enemigos = { "Sombra de Eco", "Devorador de Fase", "Larva Dimensional" };
+            return new Enemigo(enemigos[rng.Next(enemigos.Length)], rng.Next(30, 51), rng.Next(8, 13));
+        }
+
+        static void Encuentro(Explorador e)
+        {
+            Personaje ent = GenerarEntidad();
+            entidadActual = ent;
+            string tipo = ent is Robot ? "Robot" : "Enemigo";
+
+            EscribirColor($"\n👾 ENTIDAD DETECTADA: {ent.Nombre} ({tipo})", ConsoleColor.Red);
+            iris.Enviar($"ENTIDAD DETECTADA ({tipo}: {ent.Nombre}) cerca del Explorador {e.Nombre}.");
+
+            bool escapo = false;
+
+            while (!escapo && ent.EstaVivo && e.EstaVivo)
+            {
+                string vidaEnt = ent.Analizado ? $"{ent.Vida}/{ent.VidaMax}" : "???";
+                Console.WriteLine($"\nVida: {e.Vida}/{e.VidaMax} | Escudo: {e.Escudo} | Energía: {e.Energia} || {ent.Nombre}: {vidaEnt}");
+                Console.WriteLine("1. Atacar   2. Escapar   3. Utilizar objeto   4. Analizar");
+                Console.Write("Acción: ");
+                string op = (Console.ReadLine() ?? "").Trim();
+
+                bool turnoGastado = false;
+
+                try
+                {
+                    switch (op)
+                    {
+                        case "1":
+                            {
+                                int dano = e.CalcularAtaque();
+                                int real = ent.RecibirDano(dano);
+                                Console.WriteLine($"⚔ Atacas a {ent.Nombre}: -{real} vida.");
+                                turnoGastado = true;
+                                break;
+                            }
+                        case "2":
+                            {
+                                escapo = IntentarEscapar(e, ent);
+                                turnoGastado = true;
+                                break;
+                            }
+                        case "3":
+                            {
+                                Console.WriteLine();
+                                e.Inventario.Consultar();
+                                Console.Write("Objeto a utilizar (número o nombre, vacío para cancelar): ");
+                                string seleccion = Console.ReadLine() ?? "";
+                                if (string.IsNullOrWhiteSpace(seleccion)) break;
+                                Objeto objeto = e.Inventario.Buscar(seleccion);
+                                EscribirColor(e.Inventario.Utilizar(objeto, e, ent), ConsoleColor.Cyan);
+                                turnoGastado = true;
+                                break;
+                            }
+                        case "4":
+                            {
+                                if (ent.Analizado)
+                                    throw new OperacionInvalidaException("Ya analizaste a esta entidad.");
+                                if (e.Energia < 5)
+                                    throw new OperacionInvalidaException("Energía insuficiente para analizar (mínimo 5).");
+                                e.AjustarEnergia(-5);
+                                ent.Analizado = true;
+                                EscribirColor($"🔬 Análisis completado (-5 energía): {ent.Describir()}", ConsoleColor.Cyan);
+                                turnoGastado = true;
+                                break;
+                            }
+                        default:
+                            throw new OperacionInvalidaException("Acción no válida. Elige 1, 2, 3 o 4.");
+                    }
+                }
+                catch (OperacionInvalidaException ex)
+                {
+                    EscribirColor($"⚠ {ex.Message}", ConsoleColor.Yellow);
+                    continue; // no se pierde el turno
+                }
+
+                // El Enemigo contraataca siempre; el Robot solo activa su
+                // sistema defensivo cuando se le ataca o se intenta huir.
+                bool reacciona = ent is Enemigo || op == "1" || op == "2";
+                if (!escapo && ent.EstaVivo && turnoGastado && reacciona)
+                    Console.WriteLine(ent.Reaccionar(e));
+            }
+
+            entidadActual = null;
+
+            if (!e.EstaVivo)
+            {
+                EscribirColor("\n💀 Tu señal vital se extingue. NEXUS fuerza la desconexión.", ConsoleColor.Red);
+                iris.Enviar($"El Explorador {e.Nombre} fue derrotado por {ent.Nombre}.");
+                e.Conectado = false;
+                return;
+            }
+
+            if (!ent.EstaVivo)
+            {
+                EscribirColor($"\n✔ {ent.Nombre} ha sido neutralizado.", ConsoleColor.Green);
+                int xp = ent is Robot ? 30 : 40;
+                Console.WriteLine($"+{xp} XP");
+                if (e.GanarXP(xp))
+                    EscribirColor($"⬆ ¡Subes al nivel {e.Nivel}! Ataque +2 y vida +15.", ConsoleColor.Cyan);
+                if (rng.Next(1, 101) <= 60) EncontrarObjeto(e);
+            }
+
+            // Sobrevivió al encuentro (venciendo o escapando).
+            ProgresoMision(e, 2);
+        }
+
+        static bool IntentarEscapar(Explorador e, Personaje ent)
+        {
+            if (e.Energia < 5)
+            {
+                EscribirColor("Sin energía para huir (mínimo 5). La entidad te alcanza.", ConsoleColor.Yellow);
+                return false;
+            }
+
+            e.AjustarEnergia(-5);
+            int probabilidad = ent is Robot ? 70 : 50;
+
+            if (rng.Next(1, 101) <= probabilidad)
+            {
+                EscribirColor("💨 Logras escapar de la entidad (-5 energía).", ConsoleColor.Green);
+                return true;
+            }
+
+            EscribirColor("No logras escapar (-5 energía).", ConsoleColor.Yellow);
+            return false;
+        }
+
+        // ================= Reglas de nivel élite / eventos =================
+
+        static void VerificarCondicionCritica(Explorador e)
+        {
+            bool comboCritico = e.Energia < 20 && e.Estabilidad < 30;
+
+            int probabilidad = 0;
+            if (comboCritico) probabilidad = 70;
+            else if (e.Estabilidad < Explorador.ESTABILIDAD_CRITICA) probabilidad = 35;
+
+            if (probabilidad > 0 && rng.Next(1, 101) <= probabilidad)
+                e.DispararAnomaliaIris();
+        }
+
+        static void VerificarResonanciaEstable(Explorador e)
+        {
+            if (e.Estabilidad >= Explorador.ESTABILIDAD_RESONANCIA && e.NivelPeligro <= Explorador.PELIGRO_RESONANCIA)
+            {
+                EscribirColor("\n✦ Resonancia Estable detectada. NEXUS canaliza energía extra al Explorador.", ConsoleColor.Green);
+                e.AjustarEnergia(10);
+            }
+        }
+
+        static void VerificarColapsoDimensional(Explorador e)
+        {
+            if (e.Estabilidad < Explorador.ESTABILIDAD_COLAPSO && e.NivelPeligro > Explorador.PELIGRO_ALTO)
+                e.DispararColapsoDimensional();
+        }
+
+        static void ManejarAlertaIris(Explorador e)
+        {
+            advertenciasCriticas++;
+
+            EscribirColor("\n════════════════════════════════════════", ConsoleColor.Red);
+            EscribirColor("  ALERTA DE INTERFERENCIA IRIS", ConsoleColor.Red);
+            EscribirColor("════════════════════════════════════════", ConsoleColor.Red);
+            Console.WriteLine("La estabilidad de la realidad está");
+            Console.WriteLine("alcanzando niveles críticos.\n");
+            Console.WriteLine("NEXUS recomienda desconexión inmediata.");
+            Console.WriteLine($"Advertencias acumuladas: {advertenciasCriticas}/3");
+            EscribirColor("════════════════════════════════════════", ConsoleColor.Red);
+
+            iris.Enviar($"ALERTA IRIS #{advertenciasCriticas}: inestabilidad crítica detectada en el Explorador {e.Nombre} (Estabilidad: {e.Estabilidad}).");
+
+            if (advertenciasCriticas >= 3)
+            {
+                EscribirColor("\nNEXUS detectó un riesgo inaceptable para tu integridad neuronal.", ConsoleColor.Red);
+                Console.WriteLine("Se fuerza la desconexión por protocolo de seguridad.");
+                iris.Enviar($"NEXUS fuerza la desconexión del Explorador {e.Nombre} tras 3 advertencias críticas.");
+                e.Conectado = false;
+            }
+        }
+
+        static void ManejarColapsoDimensional(Explorador e)
+        {
+            colapsosDetectados++;
+
+            EscribirColor("\n╔══════════════════════════════════════╗", ConsoleColor.Magenta);
+            EscribirColor("║         COLAPSO DIMENSIONAL          ║", ConsoleColor.Magenta);
+            EscribirColor("╚══════════════════════════════════════╝", ConsoleColor.Magenta);
+            Console.WriteLine("La realidad se pliega sobre sí misma.");
+            Console.WriteLine("Estabilidad crítica combinada con peligro extremo.");
+            Console.WriteLine($"Colapsos registrados: {colapsosDetectados}/2");
+
+            iris.Enviar($"COLAPSO DIMENSIONAL #{colapsosDetectados} registrado para el Explorador {e.Nombre}.");
+
+            if (colapsosDetectados == 1)
+            {
+                Console.WriteLine("NEXUS ejecuta una estabilización de emergencia, drenando energía del Explorador.");
+                e.AjustarEnergia(-25);
+                e.AjustarEstabilidad(30);
+                e.AjustarPeligro(-30);
+            }
+            else
+            {
+                EscribirColor("NEXUS no puede contener un segundo colapso. Se fuerza el cierre total del enlace.", ConsoleColor.Red);
+                iris.Enviar($"NEXUS reporta cierre forzado del enlace del Explorador {e.Nombre} tras un segundo colapso dimensional.");
+                e.Conectado = false;
+            }
+        }
+
+        // ================= Lectura y validación de datos =================
+
+        static string LeerTexto(string mensaje)
+        {
+            string texto;
+            do
+            {
+                Console.Write(mensaje);
+                texto = Console.ReadLine() ?? "";
+                if (string.IsNullOrWhiteSpace(texto))
+                    Console.WriteLine("⚠ Este dato no puede quedar vacío. Intenta de nuevo.");
+            } while (string.IsNullOrWhiteSpace(texto));
+
+            return texto.Trim();
+        }
+
+        static int LeerEnteroEnRango(string mensaje, int min, int max)
+        {
+            while (true)
+            {
+                Console.Write(mensaje);
+                string entrada = Console.ReadLine() ?? "";
+
+                int valor;
+                if (!int.TryParse(entrada, out valor))
+                {
+                    Console.WriteLine("⚠ Debes ingresar un número entero válido (ejemplo: 25).");
+                    continue;
+                }
+
+                if (valor < min || valor > max)
+                {
+                    Console.WriteLine($"⚠ El valor debe estar entre {min} y {max}. Intenta de nuevo.");
+                    continue;
+                }
+
+                return valor;
+            }
+        }
+
+        // Para el menú: si no es un número lanza OperacionInvalidaException (se captura en Main).
+        static int LeerEntero(string mensaje)
+        {
+            Console.Write(mensaje);
+            string entrada = Console.ReadLine() ?? "";
+
+            int valor;
+            if (!int.TryParse(entrada, out valor))
+                throw new OperacionInvalidaException("Debes ingresar solo un número para seleccionar la operación.");
+
+            return valor;
+        }
+    }
+}
